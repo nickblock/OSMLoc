@@ -1,0 +1,10 @@
+__pycache__
+.bash_history
+.cache
+.ipython
+.jupyter
+.local
+.npm
+maploc/models/depth_anything/ckpt/
+*.ckpt
+./data

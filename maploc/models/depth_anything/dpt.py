@@ -200,6 +200,9 @@ class DPT_DINOv2(nn.Module):
 
         feats, depth = self.depth_head(features, patch_h, patch_w)
 
+        depth_simple = F.interpolate(depth, size=(h, w), mode="bilinear", align_corners=True)
+        depth_simple = F.relu(depth_simple)
+
         feats = self.pretrained.get_intermediate_layers(x,[2,5,8,11], return_class_token = False,reshape = True)
         feats = {"layer_0": feats[0],
                   "layer_1": feats[1],
@@ -219,7 +222,7 @@ class DPT_DINOv2(nn.Module):
         feat_loc = feat_loc[...,t // 2:t // 2 + h // 2,l // 2: l // 2 + w // 2]
         depth = depth[...,t:,l:]
 
-        out_dict = {"features": feat_loc, "depth": depth}
+        out_dict = {"features": feat_loc, "depth": depth, "simple": depth_simple.squeeze(1)}
 
         return out_dict
 

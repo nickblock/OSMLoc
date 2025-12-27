@@ -93,7 +93,7 @@ class GenericModule(pl.LightningModule):
         assert hparams_file is None, "hparams are not supported."
 
         checkpoint = torch.load(
-            checkpoint_path, map_location=map_location or (lambda storage, loc: storage)
+            checkpoint_path, map_location=map_location or (lambda storage, loc: storage), weights_only=False
         )
         if find_best:
             best_score, best_name = None, None
