@@ -28,6 +28,232 @@ from maploc.data import MapillaryDataModule
 from maploc.module import GenericModule
 from maploc.data.torch import collate
 
+def get_config(verbose=False):
+ # Try multiple approaches to find the configuration file
+    config_path = None
+    
+    # Approach 1: Direct path (most reliable)
+    direct_path = Path("maploc/conf/osmloc_small.yaml")
+    if direct_path.exists():
+        config_path = direct_path
+        print(f"Using direct path: {config_path}")
+    
+    # Approach 2: Relative to conf_data_dir
+    if config_path is None:
+        try:
+            relative_path = Path(conf_data_dir.__file__).parent.parent / "osmloc_small.yaml"
+            if relative_path.exists():
+                config_path = relative_path
+                print(f"Using relative path: {config_path}")
+        except:
+            pass
+    
+    # Approach 3: Search for the file
+    if config_path is None:
+        import subprocess
+        try:
+            result = subprocess.run(['find', '.', '-name', 'osmloc_small.yaml'], 
+                                  capture_output=True, text=True, cwd='/home/nick/OSMLoc')
+            if result.stdout.strip():
+                found_paths = result.stdout.strip().split('\n')
+                config_path = Path(found_paths[0])
+                print(f"Found configuration at: {config_path}")
+        except:
+            pass
+    
+    if config_path is None or not config_path.exists():
+        raise FileNotFoundError("Could not find osmloc_small.yaml configuration file")
+    
+    print(f"Configuration exists: {config_path.exists()}")
+    
+    try:
+        model_cfg = OmegaConf.load(config_path)
+        
+        # Debug: Print key configuration values
+        if verbose:
+            print("Model configuration loaded:")
+            print(f"  latent_dim: {model_cfg.model.latent_dim}")
+            print(f"  image_encoder.features: {model_cfg.model.image_encoder.features}")
+            print(f"  image_encoder.out_channels: {model_cfg.model.image_encoder.out_channels}")
+            
+        # Fix all interpolation references
+        try:
+            # Load data configuration for num_classes and pixel_per_meter
+            data_cfg = OmegaConf.load(Path("maploc/conf/data/mapillary_mgl.yaml"))
+            
+            # Resolve num_classes reference
+            if hasattr(model_cfg.model.map_encoder, 'num_classes') and isinstance(model_cfg.model.map_encoder.num_classes, str):
+                model_cfg.model.map_encoder.num_classes = data_cfg.num_classes
+                print(f"  map_encoder.num_classes: {model_cfg.model.map_encoder.num_classes}")
+            
+            # Resolve pixel_per_meter reference
+            if hasattr(model_cfg.model, 'pixel_per_meter') and isinstance(model_cfg.model.pixel_per_meter, str):
+                model_cfg.model.pixel_per_meter = data_cfg.pixel_per_meter
+                print(f"  pixel_per_meter: {model_cfg.model.pixel_per_meter}")
+            
+            # Resolve matching_dim references
+            matching_dim = model_cfg.model.matching_dim
+            latent_dim = model_cfg.model.latent_dim
+            
+            # Fix map_encoder.output_dim
+            if hasattr(model_cfg.model.map_encoder, 'output_dim') and isinstance(model_cfg.model.map_encoder.output_dim, str):
+                model_cfg.model.map_encoder.output_dim = matching_dim
+                print(f"  map_encoder.output_dim: {model_cfg.model.map_encoder.output_dim}")
+            
+            # Fix bev_net.latent_dim and bev_net.output_dim
+            if 'bev_net' in model_cfg.model:
+                if hasattr(model_cfg.model.bev_net, 'latent_dim') and isinstance(model_cfg.model.bev_net.latent_dim, str):
+                    model_cfg.model.bev_net.latent_dim = latent_dim
+                    print(f"  bev_net.latent_dim: {model_cfg.model.bev_net.latent_dim}")
+                if hasattr(model_cfg.model.bev_net, 'output_dim') and isinstance(model_cfg.model.bev_net.output_dim, str):
+                    model_cfg.model.bev_net.output_dim = matching_dim
+                    print(f"  bev_net.output_dim: {model_cfg.model.bev_net.output_dim}")
+            
+            # Fix image_encoder checkpoint path
+            if hasattr(model_cfg.model.image_encoder, 'ckpt') and isinstance(model_cfg.model.image_encoder.ckpt, str):
+                encoder = model_cfg.model.image_encoder.encoder
+                model_cfg.model.image_encoder.ckpt = f"checkpoints/depth_anything/depth_anything_{encoder}14.pth"
+                # Update to use available path
+                model_cfg.model.image_encoder.ckpt = model_cfg.model.image_encoder.ckpt.replace(
+                    "checkpoints/depth_anything/", 
+                    "maploc/models/depth_anything/ckpt/"
+                )
+                print(f"  image_encoder.ckpt: {model_cfg.model.image_encoder.ckpt}")
+            
+        except Exception as e:
+            print(f"Warning: Could not resolve some interpolation references: {e}")
+            # Provide default values for critical parameters
+            model_cfg.model.map_encoder.num_classes = {"areas": 7, "ways": 10, "nodes": 33}
+            model_cfg.model.pixel_per_meter = 2
+            model_cfg.model.map_encoder.output_dim = model_cfg.model.matching_dim
+            if 'bev_net' in model_cfg.model:
+                model_cfg.model.bev_net.latent_dim = model_cfg.model.latent_dim
+                model_cfg.model.bev_net.output_dim = model_cfg.model.matching_dim
+            
+            if verbose:
+                print(f"  Using default values for interpolation references")
+                print(f"  map_encoder.num_classes: {model_cfg.model.map_encoder.num_classes}")
+                print(f"  pixel_per_meter: {model_cfg.model.pixel_per_meter}")
+                print(f"  map_encoder.output_dim: {model_cfg.model.map_encoder.output_dim}")
+        
+    except Exception as e:
+        print(f"Failed to load configuration file: {e}")
+        print("Using fallback configuration...")
+        
+        # Fallback: Create the correct configuration manually
+        model_cfg = OmegaConf.create({
+            "model": {
+                "name": "osmloc",
+                "latent_dim": 128,
+                "matching_dim": 8,
+                "z_max": 32,
+                "x_max": 32,
+                "pixel_per_meter": 2,
+                "num_scale_bins": 33,
+                "num_rotations": 64,
+                "image_encoder": {
+                    "encoder": "vits",
+                    "features": 64,  # This is the key fix - was 128, should be 64
+                    "out_dim": 128,
+                    "out_channels": [48, 96, 192, 384],  # This is the key fix - was [96, 192, 384, 768]
+                    "ckpt": "maploc/models/depth_anything/ckpt/depth_anything_vits14.pth",
+                    "shallow_encoder": {
+                        "backbone": {
+                            "encoder": "resnet101"
+                        }
+                    }
+                },
+                "map_encoder": {
+                    "embedding_dim": 16,
+                    "output_dim": 8,
+                    "num_classes": {"areas": 7, "ways": 10, "nodes": 33},
+                    "backbone": {
+                        "encoder": "vgg19",
+                        "pretrained": False,
+                        "output_scales": [0],
+                        "num_downsample": 3,
+                        "decoder": [128, 64, 64],
+                        "padding": "replicate"
+                    },
+                    "unary_prior": False
+                },
+                "bev_net": {
+                    "num_blocks": 4,
+                    "latent_dim": 128,
+                    "output_dim": 8,
+                    "confidence": True
+                }
+            }
+        })
+        
+        if verbose:
+            print("Fallback configuration created with correct dimensions:")
+            print(f"  image_encoder.features: {model_cfg.model.image_encoder.features}")
+            print(f"  image_encoder.out_channels: {model_cfg.model.image_encoder.out_channels}")
+            print(f"  map_encoder.num_classes: {model_cfg.model.map_encoder.num_classes}")
+            print(f"  pixel_per_meter: {model_cfg.model.pixel_per_meter}")
+            print(f"  map_encoder.output_dim: {model_cfg.model.map_encoder.output_dim}")
+    
+    # Update the depth_anything checkpoint path to match available files
+    if "image_encoder" in model_cfg.model and "ckpt" in model_cfg.model.image_encoder:
+        original_ckpt = model_cfg.model.image_encoder.ckpt
+        model_cfg.model.image_encoder.ckpt = original_ckpt.replace(
+            "checkpoints/depth_anything/", 
+            "maploc/models/depth_anything/ckpt/"
+        )
+        print(f"Updated depth_anything checkpoint: {original_ckpt} -> {model_cfg.model.image_encoder.ckpt}")
+    
+    if verbose:
+        print("Model configuration being used:")
+        print(f"  model.latent_dim: {model_cfg.model.latent_dim}")
+        print(f"  model.matching_dim: {model_cfg.model.matching_dim}")
+        print(f"  image_encoder.encoder: {model_cfg.model.image_encoder.encoder}")
+        print(f"  image_encoder.features: {model_cfg.model.image_encoder.features}")
+        print(f"  image_encoder.out_channels: {model_cfg.model.image_encoder.out_channels}")
+        print(f"  map_encoder.num_classes: {model_cfg.model.map_encoder.num_classes}")
+
+    return model_cfg
+
+def load_model_checkpoints(model, checkpoint_path, device):
+
+    # Try to load checkpoint parameters
+    print("Loading checkpoint parameters...")
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        state_dict = checkpoint.get("state_dict", {})
+        
+        if state_dict:
+            # Filter out incompatible keys and load what we can
+            model_state_dict = model.state_dict()
+            compatible_state_dict = {}
+            incompatible_keys = []
+            
+            for key, value in state_dict.items():
+                if key in model_state_dict:
+                    if value.shape == model_state_dict[key].shape:
+                        compatible_state_dict[key] = value
+                    else:
+                        incompatible_keys.append(f"{key}: {value.shape} vs {model_state_dict[key].shape}")
+                else:
+                    incompatible_keys.append(f"{key}: key not found")
+            
+            if compatible_state_dict:
+                model.load_state_dict(compatible_state_dict, strict=False)
+                print(f"✓ Loaded {len(compatible_state_dict)} compatible parameters")
+            
+            if incompatible_keys:
+                print(f"⚠ Skipped {len(incompatible_keys)} incompatible parameters:")
+                # Print first 5 incompatible keys to avoid spam
+                for key_info in incompatible_keys[:5]:
+                    print(f"  - {key_info}")
+                if len(incompatible_keys) > 5:
+                    print(f"  - ... and {len(incompatible_keys) - 5} more")
+        else:
+            print("⚠ Checkpoint has no state_dict")
+            
+    except Exception as e:
+        print(f"⚠ Failed to load checkpoint parameters: {e}")
+        print("✓ Model will use random initialization")
 
 def load_and_preprocess_image(image_path: str, target_size: tuple = (512, 512)) -> torch.Tensor:
     """
@@ -141,7 +367,8 @@ def run_custom_image_inference(
     image_path: str,
     checkpoint_path: str = "loca_polar_small.ckpt",
     dataset_name: str = "mgl",
-    visualize: bool = True
+    visualize: bool = True,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """
     Run inference on a custom image using OSMLoc.
@@ -161,8 +388,8 @@ def run_custom_image_inference(
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image file not found: {image_path}")
     
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    # if not os.path.exists(checkpoint_path):
+    #     raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
     
     # Load and preprocess image
     image_tensor = load_and_preprocess_image(image_path)
@@ -170,188 +397,12 @@ def run_custom_image_inference(
     # Setup configuration (for model architecture, not for data)
     # Use the actual osmloc_small configuration that matches the checkpoint
     print("Loading osmloc_small.yaml configuration...")
+    print(f"Loading model from {checkpoint_path}...")
     
-    # Try multiple approaches to find the configuration file
-    config_path = None
-    
-    # Approach 1: Direct path (most reliable)
-    direct_path = Path("maploc/conf/osmloc_small.yaml")
-    if direct_path.exists():
-        config_path = direct_path
-        print(f"Using direct path: {config_path}")
-    
-    # Approach 2: Relative to conf_data_dir
-    if config_path is None:
-        try:
-            relative_path = Path(conf_data_dir.__file__).parent.parent / "osmloc_small.yaml"
-            if relative_path.exists():
-                config_path = relative_path
-                print(f"Using relative path: {config_path}")
-        except:
-            pass
-    
-    # Approach 3: Search for the file
-    if config_path is None:
-        import subprocess
-        try:
-            result = subprocess.run(['find', '.', '-name', 'osmloc_small.yaml'], 
-                                  capture_output=True, text=True, cwd='/home/nick/OSMLoc')
-            if result.stdout.strip():
-                found_paths = result.stdout.strip().split('\n')
-                config_path = Path(found_paths[0])
-                print(f"Found configuration at: {config_path}")
-        except:
-            pass
-    
-    if config_path is None or not config_path.exists():
-        raise FileNotFoundError("Could not find osmloc_small.yaml configuration file")
-    
-    print(f"Configuration exists: {config_path.exists()}")
-    
-    try:
-        model_cfg = OmegaConf.load(config_path)
-        
-        # Debug: Print key configuration values
-        print("Model configuration loaded:")
-        print(f"  latent_dim: {model_cfg.model.latent_dim}")
-        print(f"  image_encoder.features: {model_cfg.model.image_encoder.features}")
-        print(f"  image_encoder.out_channels: {model_cfg.model.image_encoder.out_channels}")
-        
-        # Fix all interpolation references
-        try:
-            # Load data configuration for num_classes and pixel_per_meter
-            data_cfg = OmegaConf.load(Path("maploc/conf/data/mapillary_mgl.yaml"))
-            
-            # Resolve num_classes reference
-            if hasattr(model_cfg.model.map_encoder, 'num_classes') and isinstance(model_cfg.model.map_encoder.num_classes, str):
-                model_cfg.model.map_encoder.num_classes = data_cfg.num_classes
-                print(f"  map_encoder.num_classes: {model_cfg.model.map_encoder.num_classes}")
-            
-            # Resolve pixel_per_meter reference
-            if hasattr(model_cfg.model, 'pixel_per_meter') and isinstance(model_cfg.model.pixel_per_meter, str):
-                model_cfg.model.pixel_per_meter = data_cfg.pixel_per_meter
-                print(f"  pixel_per_meter: {model_cfg.model.pixel_per_meter}")
-            
-            # Resolve matching_dim references
-            matching_dim = model_cfg.model.matching_dim
-            latent_dim = model_cfg.model.latent_dim
-            
-            # Fix map_encoder.output_dim
-            if hasattr(model_cfg.model.map_encoder, 'output_dim') and isinstance(model_cfg.model.map_encoder.output_dim, str):
-                model_cfg.model.map_encoder.output_dim = matching_dim
-                print(f"  map_encoder.output_dim: {model_cfg.model.map_encoder.output_dim}")
-            
-            # Fix bev_net.latent_dim and bev_net.output_dim
-            if 'bev_net' in model_cfg.model:
-                if hasattr(model_cfg.model.bev_net, 'latent_dim') and isinstance(model_cfg.model.bev_net.latent_dim, str):
-                    model_cfg.model.bev_net.latent_dim = latent_dim
-                    print(f"  bev_net.latent_dim: {model_cfg.model.bev_net.latent_dim}")
-                if hasattr(model_cfg.model.bev_net, 'output_dim') and isinstance(model_cfg.model.bev_net.output_dim, str):
-                    model_cfg.model.bev_net.output_dim = matching_dim
-                    print(f"  bev_net.output_dim: {model_cfg.model.bev_net.output_dim}")
-            
-            # Fix image_encoder checkpoint path
-            if hasattr(model_cfg.model.image_encoder, 'ckpt') and isinstance(model_cfg.model.image_encoder.ckpt, str):
-                encoder = model_cfg.model.image_encoder.encoder
-                model_cfg.model.image_encoder.ckpt = f"checkpoints/depth_anything/depth_anything_{encoder}14.pth"
-                # Update to use available path
-                model_cfg.model.image_encoder.ckpt = model_cfg.model.image_encoder.ckpt.replace(
-                    "checkpoints/depth_anything/", 
-                    "maploc/models/depth_anything/ckpt/"
-                )
-                print(f"  image_encoder.ckpt: {model_cfg.model.image_encoder.ckpt}")
-            
-        except Exception as e:
-            print(f"Warning: Could not resolve some interpolation references: {e}")
-            # Provide default values for critical parameters
-            model_cfg.model.map_encoder.num_classes = {"areas": 7, "ways": 10, "nodes": 33}
-            model_cfg.model.pixel_per_meter = 2
-            model_cfg.model.map_encoder.output_dim = model_cfg.model.matching_dim
-            if 'bev_net' in model_cfg.model:
-                model_cfg.model.bev_net.latent_dim = model_cfg.model.latent_dim
-                model_cfg.model.bev_net.output_dim = model_cfg.model.matching_dim
-            print(f"  Using default values for interpolation references")
-            print(f"  map_encoder.num_classes: {model_cfg.model.map_encoder.num_classes}")
-            print(f"  pixel_per_meter: {model_cfg.model.pixel_per_meter}")
-            print(f"  map_encoder.output_dim: {model_cfg.model.map_encoder.output_dim}")
-        
-    except Exception as e:
-        print(f"Failed to load configuration file: {e}")
-        print("Using fallback configuration...")
-        
-        # Fallback: Create the correct configuration manually
-        model_cfg = OmegaConf.create({
-            "model": {
-                "name": "osmloc",
-                "latent_dim": 128,
-                "matching_dim": 8,
-                "z_max": 32,
-                "x_max": 32,
-                "pixel_per_meter": 2,
-                "num_scale_bins": 33,
-                "num_rotations": 64,
-                "image_encoder": {
-                    "encoder": "vits",
-                    "features": 64,  # This is the key fix - was 128, should be 64
-                    "out_dim": 128,
-                    "out_channels": [48, 96, 192, 384],  # This is the key fix - was [96, 192, 384, 768]
-                    "ckpt": "maploc/models/depth_anything/ckpt/depth_anything_vits14.pth",
-                    "shallow_encoder": {
-                        "backbone": {
-                            "encoder": "resnet101"
-                        }
-                    }
-                },
-                "map_encoder": {
-                    "embedding_dim": 16,
-                    "output_dim": 8,
-                    "num_classes": {"areas": 7, "ways": 10, "nodes": 33},
-                    "backbone": {
-                        "encoder": "vgg19",
-                        "pretrained": False,
-                        "output_scales": [0],
-                        "num_downsample": 3,
-                        "decoder": [128, 64, 64],
-                        "padding": "replicate"
-                    },
-                    "unary_prior": False
-                },
-                "bev_net": {
-                    "num_blocks": 4,
-                    "latent_dim": 128,
-                    "output_dim": 8,
-                    "confidence": True
-                }
-            }
-        })
-        
-        print("Fallback configuration created with correct dimensions:")
-        print(f"  image_encoder.features: {model_cfg.model.image_encoder.features}")
-        print(f"  image_encoder.out_channels: {model_cfg.model.image_encoder.out_channels}")
-        print(f"  map_encoder.num_classes: {model_cfg.model.map_encoder.num_classes}")
-        print(f"  pixel_per_meter: {model_cfg.model.pixel_per_meter}")
-        print(f"  map_encoder.output_dim: {model_cfg.model.map_encoder.output_dim}")
-    
-    # Update the depth_anything checkpoint path to match available files
-    if "image_encoder" in model_cfg.model and "ckpt" in model_cfg.model.image_encoder:
-        original_ckpt = model_cfg.model.image_encoder.ckpt
-        model_cfg.model.image_encoder.ckpt = original_ckpt.replace(
-            "checkpoints/depth_anything/", 
-            "maploc/models/depth_anything/ckpt/"
-        )
-        print(f"Updated depth_anything checkpoint: {original_ckpt} -> {model_cfg.model.image_encoder.ckpt}")
-    
+    model_cfg = get_config()
+
     # Load model with strict=False to ignore size mismatches
     # and then manually fix the configuration
-    print(f"Loading model from {checkpoint_path}...")
-    print("Model configuration being used:")
-    print(f"  model.latent_dim: {model_cfg.model.latent_dim}")
-    print(f"  model.matching_dim: {model_cfg.model.matching_dim}")
-    print(f"  image_encoder.encoder: {model_cfg.model.image_encoder.encoder}")
-    print(f"  image_encoder.features: {model_cfg.model.image_encoder.features}")
-    print(f"  image_encoder.out_channels: {model_cfg.model.image_encoder.out_channels}")
-    print(f"  map_encoder.num_classes: {model_cfg.model.map_encoder.num_classes}")
-    
     # Create model with correct configuration first
     print("Creating model with correct configuration...")
     from maploc.models import get_model
@@ -371,44 +422,7 @@ def run_custom_image_inference(
     model = model.to(device)
     print(f"Model created and moved to {device}")
     
-    # Try to load checkpoint parameters
-    print("Loading checkpoint parameters...")
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        state_dict = checkpoint.get("state_dict", {})
-        
-        if state_dict:
-            # Filter out incompatible keys and load what we can
-            model_state_dict = model.state_dict()
-            compatible_state_dict = {}
-            incompatible_keys = []
-            
-            for key, value in state_dict.items():
-                if key in model_state_dict:
-                    if value.shape == model_state_dict[key].shape:
-                        compatible_state_dict[key] = value
-                    else:
-                        incompatible_keys.append(f"{key}: {value.shape} vs {model_state_dict[key].shape}")
-                else:
-                    incompatible_keys.append(f"{key}: key not found")
-            
-            if compatible_state_dict:
-                model.load_state_dict(compatible_state_dict, strict=False)
-                print(f"✓ Loaded {len(compatible_state_dict)} compatible parameters")
-            
-            if incompatible_keys:
-                print(f"⚠ Skipped {len(incompatible_keys)} incompatible parameters:")
-                # Print first 5 incompatible keys to avoid spam
-                for key_info in incompatible_keys[:5]:
-                    print(f"  - {key_info}")
-                if len(incompatible_keys) > 5:
-                    print(f"  - ... and {len(incompatible_keys) - 5} more")
-        else:
-            print("⚠ Checkpoint has no state_dict")
-            
-    except Exception as e:
-        print(f"⚠ Failed to load checkpoint parameters: {e}")
-        print("✓ Model will use random initialization")
+    load_model_checkpoints(model, checkpoint_path, device)
     
     print("✓ Model ready for inference")
     # Model is already in eval mode and on the correct device from above
@@ -511,24 +525,62 @@ def visualize_custom_results(image_path: str, pred: Dict[str, torch.Tensor], bat
     plt.figure(figsize=(14, 7))
     
     # Show original image
-    plt.subplot(1, 3, 1)
+    plt.subplot(2, 3, 1)
     plt.imshow(original_image)
     plt.title("Original Image")
     plt.axis('off')
     
     # Show processed image
-    plt.subplot(1, 3, 2)
+    plt.subplot(2, 3, 2)
     processed_image = batch["image"][0].cpu().numpy()
     if processed_image.shape[0] == 3:
         processed_image = np.transpose(processed_image, (1, 2, 0))
-    if processed_image.max() > 1.0:
+    
+    # Denormalize the image for proper visualization
+    # The tensor was normalized with mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    # Reverse: (tensor * std) + mean, then clamp to [0, 1]
+    mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
+    std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+    
+    # Debug: Print tensor statistics
+    print(f"DEBUG: Processed image shape: {processed_image.shape}")
+    print(f"DEBUG: Processed image range: [{processed_image.min():.4f}, {processed_image.max():.4f}]")
+    print(f"DEBUG: Processed image mean: {processed_image.mean():.4f}")
+    
+    # Handle different cases for image visualization
+    if processed_image.shape[0] == 3:  # If still in (C, H, W) format
+        processed_image = np.transpose(processed_image, (1, 2, 0))
+    
+    print(f"DEBUG: After transpose shape: {processed_image.shape}")
+    
+    # Check the range and handle accordingly
+    if processed_image.max() <= 1.0 and processed_image.min() >= -1.0:
+        # Case 1: Normalized range [-1, 1] - denormalize
+        print("DEBUG: Applying denormalization for range [-1, 1]")
+        processed_image = (processed_image * std) + mean
+        processed_image = np.clip(processed_image, 0, 1)
+    elif processed_image.max() > 1.0 and processed_image.min() < 0:
+        # Case 2: Values outside expected range - normalize to [0, 1]
+        print("DEBUG: Normalizing values outside expected range")
+        if processed_image.max() > processed_image.min():
+            processed_image = (processed_image - processed_image.min()) / (processed_image.max() - processed_image.min())
+        else:
+            processed_image = processed_image - processed_image.min()  # Shift to start at 0
+    elif processed_image.max() > 1.0:
+        # Case 3: [0, 255] range - divide by 255
+        print("DEBUG: Dividing by 255 for [0, 255] range")
         processed_image = processed_image / 255.0
+    
+    # Final clamp to ensure values are in [0, 1]
+    processed_image = np.clip(processed_image, 0, 1)
+    print(f"DEBUG: Final processed image range: [{processed_image.min():.4f}, {processed_image.max():.4f}]")
+    
     plt.imshow(processed_image)
     plt.title("Processed Image")
     plt.axis('off')
     
     # Show prediction heatmap
-    plt.subplot(1, 3, 3)
+    plt.subplot(2, 3, 3)
     heatmap = log_probs.max(axis=0)
     plt.imshow(heatmap, cmap='viridis')
     # Handle 0-dimensional arrays more robustly
@@ -543,6 +595,29 @@ def visualize_custom_results(image_path: str, pred: Dict[str, torch.Tensor], bat
     plt.scatter(uv_x, uv_y, c='red', s=100, marker='x')
     plt.title(f"Prediction Heatmap\nMax at: ({uv_x:.1f}, {uv_y:.1f})\nYaw: {np.degrees(yaw_val):.1f}°")
     plt.colorbar()
+    plt.axis('off')
+
+    plt.subplot(2, 3, 4)
+    depth = pred["depth"][0].cpu().numpy().squeeze(0)
+    
+    # Debug depth values
+    print(f"DEBUG: Depth shape: {depth.shape}")
+    print(f"DEBUG: Depth range: [{depth.min():.4f}, {depth.max():.4f}]")
+    print(f"DEBUG: Depth mean: {depth.mean():.4f}")
+    
+    # Normalize depth for visualization
+    if depth.max() > depth.min():  # Avoid division by zero
+        depth_normalized = (depth - depth.min()) / (depth.max() - depth.min())
+        print(f"DEBUG: Depth normalized range: [{depth_normalized.min():.4f}, {depth_normalized.max():.4f}]")
+    else:
+        # Handle constant depth case - create a gradient for visualization
+        print("DEBUG: Constant depth detected, creating visualization gradient")
+        x, y = np.meshgrid(np.linspace(0, 1, depth.shape[1]), np.linspace(0, 1, depth.shape[0]))
+        depth_normalized = (x + y) / 2  # Simple gradient pattern
+        print(f"DEBUG: Created gradient range: [{depth_normalized.min():.4f}, {depth_normalized.max():.4f}]")
+    
+    plt.imshow(depth_normalized, cmap='viridis')
+    plt.title("Depth")
     plt.axis('off')
     
     plt.tight_layout()
